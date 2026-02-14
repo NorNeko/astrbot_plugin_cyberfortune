@@ -37,7 +37,7 @@
 # 安装（与源项目相同）
 
 ## 插件市场 (推荐)
-在 AstrBot 插件市场搜索 `astrbot_cyberfortune` 即可一键安装。
+在 AstrBot 插件市场搜索 `astrbot_cyberfortune` 即可一键安装。（等待审核中，暂未上架）
 
 ## 源码安装
 1. 进入 AstrBot 的插件目录：

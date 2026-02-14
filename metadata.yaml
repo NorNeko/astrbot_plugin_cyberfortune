@@ -1,5 +1,5 @@
-name: astrbot_cyberfortune
+name: astrbot_plugin_cyberfortune
 desc: 基于Xbodwf大佬的astrbot每日运势插件项目改版
-version: 1.0.0
-author: norneko
-repo: https://github.com/NorNeko/astrbot_cyberfortune
+version: 1.1.0
+author: B2347
+repo: https://github.com/NorNeko/astrbot_plugin_cyberfortune

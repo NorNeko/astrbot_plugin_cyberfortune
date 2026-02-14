@@ -12,6 +12,10 @@ import tempfile
 import ssl
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import urllib.parse
+import socket
+import ipaddress
+
 try:
     from colornamer import get_color_from_rgb
 except:
@@ -28,15 +32,16 @@ except ImportError:
 
 LUCKY_NUMBERS = [0, 1, 2, 3, 5, 6, 7, 8, 9]
 FESTIVE_MIN_LUCK = 70
+MAX_DOWNLOAD_SIZE = 15 * 1024 * 1024  # 15MB 内存保护阈值
 
 
-@register("astrbot_plugin_cyberfortune", "noneko", "今日运势生成器 - 生成一张二次元风格的运势图片", "1.0.1")
+@register("astrbot_plugin_cyberfortune", "B2347", "今日运势生成器 - 基于Xbodwf大佬的astrbot每日运势插件项目改版", "v1.1.0")
 class FortunePlugin(Star):
     """今日运势插件 - 生成精美的运势图片"""
     
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        self.config = config or {}  # 接收框架注入的配置，如果没有则给个空字典兜底
+        self.config = config or {}  
         self.data_dir = os.path.dirname(os.path.abspath(__file__))
         self.backgrounds_path = os.path.join(self.data_dir, "backgrounds.json")
         self.yunshi_data_path = StarTools.get_data_dir("astrbot_plugin_cyberfortune") / "yunshi.json"
@@ -82,7 +87,6 @@ class FortunePlugin(Star):
         if not self.backgrounds_data:
             return ""
         
-        # 如果指定了图源名称
         if source_name:
             if source_name in self.backgrounds_data:
                 chosen = self.backgrounds_data[source_name]
@@ -100,9 +104,8 @@ class FortunePlugin(Star):
                         return chosen
                     if t == "object":
                         return chosen
-            return "" # 指定图源不存在或无效
+            return "" 
 
-        # 未指定图源，随机选择
         source_keys = []
         for k, v in self.backgrounds_data.items():
             if isinstance(v, list) and len(v) > 0:
@@ -153,13 +156,11 @@ class FortunePlugin(Star):
             if isinstance(cur, list):
                 if len(cur) == 0:
                     return None
-                # 支持数字索引
                 if p.isdigit():
                     idx = int(p)
                     if 0 <= idx < len(cur):
                         cur = cur[idx]
-                        continue # 消耗掉该 part，进入下一个
-                # 兼容原有的随机选择逻辑
+                        continue 
                 cur = random.choice(cur)
             
             if isinstance(cur, dict):
@@ -170,80 +171,153 @@ class FortunePlugin(Star):
             else:
                 return None
         return cur
+
+    async def _is_safe_url(self, url: str) -> bool:
+        """安全校验：防止 SSRF 漏洞，拦截私有/内网 IP 访问"""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in ('http', 'https'):
+                logger.warning(f"被拦截的安全风险: 不支持的协议协议 {parsed.scheme}")
+                return False
+            
+            hostname = parsed.hostname
+            if not hostname:
+                return False
+            
+            if hostname.lower() in ('localhost', '127.0.0.1', '::1'):
+                logger.warning(f"被拦截的 SSRF 尝试: 本地主机 {hostname}")
+                return False
+
+            loop = asyncio.get_event_loop()
+            try:
+                # 异步解析 DNS，获取 IP 地址列表
+                addr_info = await loop.getaddrinfo(hostname, None)
+            except socket.gaierror:
+                logger.error(f"DNS 解析失败: {hostname}")
+                return False
+
+            for info in addr_info:
+                ip_str = info[4][0]
+                ip_obj = ipaddress.ip_address(ip_str)
+                # 检查是否为私网、多播、回环、链路本地等高危内部网络段
+                if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_link_local or ip_obj.is_unspecified:
+                    logger.warning(f"被拦截的 SSRF 尝试: 目标解析为内网/保留 IP ({ip_str})")
+                    return False
+                    
+            return True
+        except Exception as e:
+            logger.error(f"URL 安全检查异常: {e}")
+            return False
+
+    async def _safe_fetch(self, url: str, method: str = "GET", headers: dict = None, timeout: int = 15) -> tuple[int, dict, bytes]:
+        """安全下载引擎：防重定向 SSRF 逃逸 & 防止大文件内存 OOM 攻击"""
+        max_redirects = 3
+        current_url = url
+        proxy = self._get_proxy()
+        
+        base_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        req_headers = {**base_headers, **headers} if isinstance(headers, dict) else base_headers
+        
+        async with aiohttp.ClientSession() as session:
+            for step in range(max_redirects + 1):
+                # 每一次重定向都需要重新进行安全白名单校验
+                if not await self._is_safe_url(current_url):
+                    raise Exception(f"安全策略拦截：拒绝访问非法或高危内网地址 -> {current_url}")
+                
+                async with session.request(method.upper(), current_url,
+                                         timeout=aiohttp.ClientTimeout(total=timeout),
+                                         headers=req_headers,
+                                         proxy=proxy,
+                                         allow_redirects=False) as resp: # 禁用默认重定向，便于安检
+                    
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
+                            raise Exception("异常重定向：响应体中缺少 Location 头部")
+                        current_url = urllib.parse.urljoin(str(resp.url), location)
+                        continue
+                        
+                    if resp.status != 200:
+                        raise Exception(f"请求失败 (HTTP {resp.status} {resp.reason})")
+                        
+                    # 提前拦截：基于 Content-Length 进行大小阻隔
+                    content_length = resp.headers.get("Content-Length")
+                    if content_length and int(content_length) > MAX_DOWNLOAD_SIZE:
+                        raise Exception(f"安全拦截：文件声明体积过大 ({int(content_length)/1024/1024:.2f}MB)，已拒绝处理")
+                        
+                    # 分块读取：防范未知 Content-Length 造成的内存炸弹
+                    downloaded_bytes = bytearray()
+                    async for chunk in resp.content.iter_chunked(8192):
+                        downloaded_bytes.extend(chunk)
+                        if len(downloaded_bytes) > MAX_DOWNLOAD_SIZE:
+                            raise Exception(f"安全拦截：接收文件流体积超过系统限制 ({MAX_DOWNLOAD_SIZE/1024/1024:.0f}MB)，已强制阻断")
+                            
+                    return resp.status, dict(resp.headers), bytes(downloaded_bytes)
+                    
+            raise Exception(f"重定向链路过长 (超过 {max_redirects} 次)，已中止。")
     
     async def _resolve_api_image_url(self, spec: dict, timeout: int = 15):
         url = spec.get("url")
         method = str(spec.get("method", "get")).lower()
         expected = str(spec.get("expected", "url")).lower()
         headers = spec.get("headers") or {}
-        img_headers = spec.get("img_headers") # 新增：图片下载请求头
+        img_headers = spec.get("img_headers") 
         addition_tmpl = spec.get("addition")
-        base_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        req_headers = {**base_headers, **headers} if isinstance(headers, dict) else base_headers
-        proxy = self._get_proxy()
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.request(method.upper(), url, 
-                                         timeout=aiohttp.ClientTimeout(total=timeout), 
-                                         headers=req_headers,
-                                         proxy=proxy) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"API请求失败 (HTTP {resp.status} {resp.reason})")
-                    
-                    if expected == "image":
-                        data = await resp.read()
-                        try:
-                            img = Image.open(BytesIO(data))
-                        except Exception as e:
-                            raise Exception(f"API返回的图片解析失败: {e}")
-                        
-                        addition_text = ""
-                        if addition_tmpl:
-                            addition_text = addition_tmpl 
-                        return img, addition_text, img_headers
-                    
+            # 统一使用安全引擎下载
+            status, resp_headers, body_bytes = await self._safe_fetch(url, method=method, headers=headers, timeout=timeout)
+                
+            if expected == "image":
+                try:
+                    img = Image.open(BytesIO(body_bytes))
+                except Exception as e:
+                    raise Exception(f"API返回的图片解析失败: {e}")
+                
+                addition_text = addition_tmpl if addition_tmpl else ""
+                return img, addition_text, img_headers
+            
+            try:
+                js = json.loads(body_bytes.decode('utf-8'))
+            except Exception as e:
+                raise Exception(f"API返回格式非JSON: {e}")
+            
+            token = spec.get("token") or ""
+            replacement = spec.get("replacement") 
+            img_url = url
+            if isinstance(js, dict) and token:
+                val = self._extract_token_value(js, token)
+                if isinstance(val, str):
+                    img_url = val
+                elif isinstance(val, list) and len(val) > 0 and isinstance(val[0], str):
+                    img_url = random.choice(val)
+                else:
+                    raise Exception(f"Token '{token}' 未能解析到有效的图片URL路径")
+            
+            if replacement and isinstance(replacement, dict):
+                import re
+                pattern = replacement.get("pattern")
+                repl = replacement.get("replace")
+                if pattern and repl:
                     try:
-                        js = await resp.json()
+                        img_url = re.sub(pattern, repl, img_url)
+                        logger.info(f"应用替换规则: {img_url}")
                     except Exception as e:
-                        raise Exception(f"API返回格式非JSON: {e}")
-                    
-                    token = spec.get("token") or ""
-                    replacement = spec.get("replacement")  # 新增：正则替换规则
-                    img_url = url
-                    if isinstance(js, dict) and token:
-                        val = self._extract_token_value(js, token)
-                        if isinstance(val, str):
-                            img_url = val
-                        elif isinstance(val, list) and len(val) > 0 and isinstance(val[0], str):
-                            img_url = random.choice(val)
-                        else:
-                            raise Exception(f"Token '{token}' 未能解析到有效的图片URL路径")
-                    
-                    # 执行正则替换
-                    if replacement and isinstance(replacement, dict):
-                        import re
-                        pattern = replacement.get("pattern")
-                        repl = replacement.get("replace")
-                        if pattern and repl:
-                            try:
-                                img_url = re.sub(pattern, repl, img_url)
-                                logger.info(f"应用替换规则: {img_url}")
-                            except Exception as e:
-                                logger.error(f"正则替换失败: {e}")
-                    
-                    addition_text = ""
-                    if addition_tmpl and isinstance(js, dict):
-                        # Simple template parsing: {data.pid} -> js['data']['pid']
-                        import re
-                        def _repl(match):
-                            path = match.group(1)
-                            v = self._extract_token_value(js, path)
-                            return str(v) if v is not None else match.group(0)
-                        addition_text = re.sub(r"\{(.*?)\}", _repl, addition_tmpl)
-                    
-                    return img_url, addition_text, img_headers
+                        logger.error(f"正则替换失败: {e}")
+            
+            addition_text = ""
+            if addition_tmpl and isinstance(js, dict):
+                import re
+                def _repl(match):
+                    path = match.group(1)
+                    v = self._extract_token_value(js, path)
+                    return str(v) if v is not None else match.group(0)
+                addition_text = re.sub(r"\{(.*?)\}", _repl, addition_tmpl)
+            
+            return img_url, addition_text, img_headers
+                
         except asyncio.TimeoutError:
             raise Exception("API请求超时")
         except Exception as e:
@@ -294,7 +368,7 @@ class FortunePlugin(Star):
             if spec_type == "object":
                 img_url, addition_text, img_headers = await self._resolve_object_image(bg_spec)
                 background = await self._download_image(img_url, headers=img_headers)
-            else: # 默认为 api
+            else: 
                 resolved, addition_text, img_headers = await self._resolve_api_image_url(bg_spec)
                 if isinstance(resolved, Image.Image):
                     background = resolved
@@ -314,27 +388,18 @@ class FortunePlugin(Star):
     async def _download_image(self, url: str, timeout: int = 15, headers: dict | None = None) -> Image.Image:
         """异步下载图片"""
         logger.info(f"正在下载图片: {url}")
-        base_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        req_headers = {**base_headers, **headers} if isinstance(headers, dict) else base_headers
-        proxy = self._get_proxy()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout), 
-                                       headers=req_headers, proxy=proxy) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"HTTP {resp.status} {resp.reason}")
-                    data = await resp.read()
-                    try:
-                        return Image.open(BytesIO(data))
-                    except Exception as e:
-                        raise Exception(f"图片格式解析失败: {e}")
+            # 统一使用安全下载引擎
+            status, resp_headers, body_bytes = await self._safe_fetch(url, timeout=timeout, headers=headers)
+            try:
+                return Image.open(BytesIO(body_bytes))
+            except Exception as e:
+                raise Exception(f"图片格式解析失败: {e}")
         except asyncio.TimeoutError:
             raise Exception("请求超时")
         except Exception as e:
             if isinstance(e, Image.DecompressionBombError):
-                raise Exception("图片过大，拒绝处理")
+                raise Exception("图片尺寸炸弹警告，拒绝处理")
             raise e
     
     async def _get_avatar_url(self, event: AstrMessageEvent) -> str:
@@ -375,11 +440,9 @@ class FortunePlugin(Star):
         try:
             with open(fortune_data_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # Convert hex colors to RGB tuples
                 for level, fortunes in data.items():
                     for fortune in fortunes:
                         if "color" in fortune and isinstance(fortune["color"], str):
-                            # Convert hex to RGB
                             hex_color = fortune["color"].lstrip('#')
                             fortune["color"] = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
                 return data
@@ -462,88 +525,73 @@ class FortunePlugin(Star):
             if base.startswith("天") and adj:
                 return adj + base
             return (adj + base) if adj else base
-        
-
-        # webcolor不支持中文,只能硬编码...
         return "彩色"
         
     def _get_color_name(self, rgb: tuple) -> str:
-        """Get color name based on RGB value ranges"""
         r, g, b = rgb
-        
-        # Calculate brightness
         brightness = (r + g + b) / 3
         
-        # Black, white, or gray
         if brightness < 30:
             return "黑色"
         elif brightness > 240 and max(r,g,b) - min(r,g,b) < 30:
             return "白色"
-        elif max(abs(r-g), abs(g-b), abs(b-r)) < 20:  # Similar values = gray
+        elif max(abs(r-g), abs(g-b), abs(b-r)) < 20: 
             return "灰色"
         
-        # Calculate dominant color
         max_val = max(r, g, b)
         min_val = min(r, g, b)
         delta = max_val - min_val
         
-        # Calculate hue
         if delta == 0:
             h = 0
         elif max_val == r:
             h = 60 * (((g - b) / delta) % 6)
         elif max_val == g:
             h = 60 * (((b - r) / delta) + 2)
-        else:  # max_val == b
+        else: 
             h = 60 * (((r - g) / delta) + 4)
         
-        # Normalize hue to 0-360
         h = h % 360
         
-        # Calculate saturation
         if max_val == 0:
             s = 0
         else:
             s = delta / max_val * 100
         
-        # Determine color based on hue and saturation
-        if s < 20:  # Low saturation = gray
+        if s < 20: 
             return "灰色"
-        elif h < 15 or h >= 345:  # Red
+        elif h < 15 or h >= 345: 
             if s > 70 and r > 200 and g < 100 and b < 100:
                 return "正红色"
             elif r > 200 and g > 150 and b > 150:
                 return "粉红色"
             return "红色"
-        elif 15 <= h < 45:  # Orange
+        elif 15 <= h < 45: 
             return "橙色"
-        elif 45 <= h < 75:  # Yellow
+        elif 45 <= h < 75: 
             return "黄色"
-        elif 75 <= h < 165:  # Green
+        elif 75 <= h < 165: 
             if max_val < 100:
                 return "深绿色"
             return "绿色"
-        elif 165 <= h < 195:  # Cyan
+        elif 165 <= h < 195: 
             return "青色"
-        elif 195 <= h < 255:  # Blue
+        elif 195 <= h < 255: 
             if max_val < 100:
                 return "深蓝色"
             return "蓝色"
-        elif 255 <= h < 285:  # Purple
+        elif 255 <= h < 285: 
             return "紫色"
-        else:  # 285-345 Magenta
+        else:
             return "品红色"
     
     def _get_random_hex_color(self) -> dict:
-        """生成随机的十六进制颜色"""
         import random
-        # Generate random RGB values
         r = random.randint(0, 255)
         g = random.randint(0, 255)
         b = random.randint(0, 255)
         hex_color = f"#{r:02x}{g:02x}{b:02x}".upper()
 
-        # 先尝试正规库命名，若失败则回退到旧算法
         lib_name_zh = self._zh_color_name_from_en(self._english_color_name_from_rgb((r, g, b)))
         final_name = lib_name_zh if lib_name_zh and lib_name_zh != "彩色" else self._get_color_name((r, g, b))
 
@@ -554,30 +602,21 @@ class FortunePlugin(Star):
         }
     
     def _is_festive_day(self, dt: datetime) -> bool:
-        """判断是否为重大节假日 (元旦、春节、元宵、端午、中秋等)"""
-        # 1. 元旦 (公历 1月1日)
         if dt.month == 1 and dt.day == 1:
             return True
-        
-        # 2. 农历节日 (使用 zhdate 计算)
         if ZhDate:
             try:
                 lunar = ZhDate.from_datetime(dt)
-                # 春节 (正月初一)
                 if lunar.l_month == 1 and lunar.l_day == 1:
                     return True
-                # 元宵节 (正月十五)
                 if lunar.l_month == 1 and lunar.l_day == 15:
                     return True
-                # 端午节 (五月初五)
                 if lunar.l_month == 5 and lunar.l_day == 5:
                     return True
-                # 中秋节 (八月十五)
                 if lunar.l_month == 8 and lunar.l_day == 15:
                     return True
             except Exception:
                 pass
-                
         return False
         
     def _get_fortune_for_user(self, user_id: str) -> dict:
@@ -600,7 +639,7 @@ class FortunePlugin(Star):
                 "fortune": {
                     "level": "中吉", 
                     "desc": "平稳安康，小有收获", 
-                    "color": (144, 238, 144)  # Light green
+                    "color": (144, 238, 144) 
                 },
                 "lucky_color": self._get_random_hex_color(),
                 "lucky_number": random.choice(LUCKY_NUMBERS),
@@ -609,28 +648,21 @@ class FortunePlugin(Star):
             }
         
         rng = random.Random()
-        # 移除固定的日期和ID种子，改用系统当前时间作为真实随机种子
-        # yunshi.json 文件保存机制来防止普通用户多次抽取了
-        #seed = f"{user_id}-{today_str}"
-        #rng = random.Random(seed)
         
         luck_levels = list(fortune_data.keys())
         if self._is_festive_day(today_dt):
             luck_levels = [lvl for lvl in luck_levels if int(lvl) >= FESTIVE_MIN_LUCK] or luck_levels
 
-# ==================== VIP 配置读取及逻辑 开始 ====================
         vip_user_ids = []
         vip_min_luck = 80
         
-        # 尝试从 AstrBot 配置系统中读取 UI 设定的值
         if hasattr(self, "config") and self.config:
             fortune_config = self.config.get("fortune_config", {})
             raw_vips = fortune_config.get("VIP_USER_IDS", [])
             
-            # 兼容处理：确保列表里的 ID 都是字符串格式，方便与 user_id 匹配
             if isinstance(raw_vips, list):
                 vip_user_ids = [str(uid) for uid in raw_vips]
-            elif isinstance(raw_vips, str): # 防御性编程：如果UI传回了逗号分隔的字符串
+            elif isinstance(raw_vips, str): 
                 vip_user_ids = [uid.strip() for uid in raw_vips.split(",") if uid.strip()]
             
             try:
@@ -638,7 +670,6 @@ class FortunePlugin(Star):
             except ValueError:
                 vip_min_luck = 80
 
-        # 判断并应用保底
         if str(user_id) in vip_user_ids:
             target_min_luck = vip_min_luck
             vip_levels = [lvl for lvl in luck_levels if int(lvl) >= target_min_luck]
@@ -649,7 +680,6 @@ class FortunePlugin(Star):
                 luck_levels = [max(luck_levels, key=lambda x: int(x))]
                 
             logger.info(f"检测到配置项VIP用户 {user_id}，已触发运势保底机制 (min: {target_min_luck})")
-# ==================== VIP 配置读取及逻辑 结束 ====================
 
         selected_level = rng.choice(luck_levels)
         level_data = fortune_data[selected_level]
@@ -663,12 +693,12 @@ class FortunePlugin(Star):
             "fortune": {
                 "level": fortune["level"],
                 "desc": fortune["desc"],
-                "color": fortune.get("color", (255, 255, 255))  # 使用JSON中定义的颜色，如果没有则使用白色
+                "color": fortune.get("color", (255, 255, 255)) 
             },
             "lucky_color": lucky_color,
             "lucky_number": lucky_number,
             "advice": advice,
-            "luck_value": int(selected_level)  # 使用选择的等级作为幸运值
+            "luck_value": int(selected_level) 
         }
         
         self.user_fortune_data[user_id] = {
@@ -681,11 +711,9 @@ class FortunePlugin(Star):
     
     def _create_fortune_image(self, background: Image.Image, avatar: Image.Image | None,
                               user_name: str, fortune_data: dict, addition_text: str = "") -> Image.Image:
-        """创建运势图片"""
         target_width = 800
         target_height = 1200
         
-        # 处理背景图片
         bg_ratio = background.width / background.height
         target_ratio = target_width / target_height
         
@@ -703,7 +731,6 @@ class FortunePlugin(Star):
         if background.mode != 'RGBA':
             background = background.convert('RGBA')
         
-        # 底部半透明遮罩
         overlay = Image.new('RGBA', (target_width, target_height), (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
         
@@ -720,7 +747,7 @@ class FortunePlugin(Star):
             if not os.path.exists(font_path):
                 font_path = os.path.join(self.data_dir, "fonts", "1.ttf")
             
-            font_large = ImageFont.truetype(font_path, 72) # 这里字号部分非功能更新则不需要动
+            font_large = ImageFont.truetype(font_path, 72)
             font_medium = ImageFont.truetype(font_path, 28)
             font_small = ImageFont.truetype(font_path, 28)
             font_tiny = ImageFont.truetype(font_path, 22)
@@ -805,7 +832,7 @@ class FortunePlugin(Star):
             [(color_block_x, color_block_y), 
              (color_block_x + color_block_size, color_block_y + color_block_size)],
             radius=8,
-            fill=tuple(lucky_color['rgb'])  # 使用RGB元组
+            fill=tuple(lucky_color['rgb'])  
         )
 
         text_x = color_block_x + color_block_size + 10
@@ -830,7 +857,6 @@ class FortunePlugin(Star):
         return background.convert('RGB')
     
     def _process_background(self, bg: Image.Image) -> Image.Image:
-        """处理背景图片（裁剪和缩放）"""
         target_width = 800
         target_height = 1200
         
@@ -853,7 +879,6 @@ class FortunePlugin(Star):
         return result_image
 
     async def _handle_none_generation(self, event: AstrMessageEvent, source_name: str = None):
-        """处理纯背景图片获取逻辑"""
         try:
             bg_spec = self._get_background_spec(source_name)
             if not bg_spec:
@@ -863,7 +888,6 @@ class FortunePlugin(Star):
                     yield event.plain_result("暂无背景图源配置，请检查 backgrounds.json~")
                 return
 
-            # 获取背景图和附加文本
             background, _ = await self._get_background_and_addition(bg_spec)
             
             if not background:
@@ -900,7 +924,6 @@ class FortunePlugin(Star):
                     yield event.plain_result("暂无背景图源配置，请检查 backgrounds.json~")
                 return
 
-            # 获取背景图和附加文本
             background, addition_text = await self._get_background_and_addition(bg_spec)
             
             if not background:
@@ -1003,39 +1026,30 @@ class FortunePlugin(Star):
     @filter.command("jrysd")
     async def jrysd(self, event: AstrMessageEvent, target_id: str):
         """[管理员] 清除指定用户的今日运势记录。用法：/jrysd <账号>"""
-        # 转换为字符串并去除两端可能存在的隐形空格
         sender_id = str(event.get_sender_id()).strip()
         
-        # 读取管理员名单
         admin_ids = []
         if hasattr(self, "config") and self.config:
             fortune_config = self.config.get("fortune_config", {})
             raw_admins = fortune_config.get("ADMIN_USER_IDS", [])
             
-            # 兼容 UI 传递的列表或字符串，并严格清理格式
             if isinstance(raw_admins, list):
                 admin_ids = [str(uid).strip() for uid in raw_admins if uid]
             elif isinstance(raw_admins, str):
                 admin_ids = [str(uid).strip() for uid in raw_admins.split(",") if uid.strip()]
                 
-        # 将鉴权过程输出到终端控制台，方便排查
         logger.info(f"[jrysd] 鉴权触发 - 发送者ID: '{sender_id}', 当前配置的管理员列表: {admin_ids}")
                 
-        # 鉴权：判断发送指令的人是否在管理员名单中
         if sender_id not in admin_ids:
-            # 系统读到的 ID ，对比和复制
             yield event.plain_result(f"❌ 权限不足！\n系统识别到您的ID为: 【{sender_id}】\n该操作仅限管理员行为。")
             return
             
-        # 准备执行清除逻辑
         today_str = datetime.now().strftime("%Y-%m-%d")
         target_id_str = str(target_id).strip()
         
-        # 检查该用户是否有记录且记录是否是今天的
         if target_id_str in self.user_fortune_data:
             user_data = self.user_fortune_data[target_id_str]
             if user_data.get("date") == today_str:
-                # 删除该用户的记录并保存到文件
                 del self.user_fortune_data[target_id_str]
                 self._save_yunshi_data()
                 yield event.plain_result(f"✅ 成功清除用户 {target_id_str} 的今日运势记录，该用户现在可以重新抽取了！")

@@ -1,0 +1,76 @@
+{
+  "fortune_config": {
+    "description": "运势配置",
+    "type": "object",
+    "hint": "配置今日运势相关参数",
+    "items": {
+      "ADMIN_USER_IDS": {
+        "description": "管理员ID列表",
+        "type": "list",
+        "hint": "拥有最高权限的用户ID，允许使用 /jrysd 清除运势",
+        "default": []
+      },
+      "VIP_USER_IDS": {
+        "description": "VIP用户ID列表",
+        "type": "list",
+        "hint": "享受高运势保底的用户ID（如QQ号），添加多个请按回车",
+        "default": []
+      },
+      "VIP_MIN_LUCK_VALUE": {
+        "description": "VIP保底幸运值",
+        "type": "int",
+        "hint": "VIP用户抽取的幸运值下限 (0-100)",
+        "default": 80
+      },
+      "request_timeout": {
+        "description": "图片下载超时时间",
+        "type": "float",
+        "hint": "单位：秒，下载背景图片的最大等待时间",
+        "default": 30.0
+      },
+      "proxy": {
+        "description": "网络代理",
+        "type": "string",
+        "hint": "网络代理地址，例如 http://127.0.0.1:7890，留空则不使用代理",
+        "default": ""
+      },
+      "avatar_size": {
+        "description": "头像大小",
+        "type": "int",
+        "hint": "用户头像的显示尺寸（像素）",
+        "default": 80
+      },
+      "card_height": {
+        "description": "信息卡片高度",
+        "type": "int",
+        "hint": "底部信息卡片的高度（像素）",
+        "default": 200
+      }
+    }
+  },
+  "display_config": {
+    "description": "显示配置",
+    "type": "object",
+    "hint": "控制运势图片的显示样式",
+    "items": {
+      "show_lucky_tip": {
+        "description": "显示幸运提示",
+        "type": "bool",
+        "hint": "是否在运势图片中显示幸运物品/颜色/数字等提示",
+        "default": true
+      },
+      "show_daily_advice": {
+        "description": "显示每日建议",
+        "type": "bool",
+        "hint": "是否在运势图片中显示每日行动建议",
+        "default": true
+      },
+      "image_quality": {
+        "description": "图片质量",
+        "type": "int",
+        "hint": "输出图片的JPEG质量（1-100）",
+        "default": 95
+      }
+    }
+  }
+}
